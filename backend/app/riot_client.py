@@ -3,10 +3,15 @@ from __future__ import annotations
 import hashlib
 import math
 from typing import Any
+from urllib.parse import quote
+
+import logging
 
 import httpx
 
 from app.config import Settings
+
+logger = logging.getLogger("porobook")
 
 QUEUE_NAMES: dict[int, str] = {
     0: "Custom",
@@ -95,6 +100,7 @@ class RiotClient:
         return str(r.json()["id"])
 
     async def active_game(self, client: httpx.AsyncClient, encrypted_summoner_id: str) -> dict | None:
+        """Legacy v4 path by encrypted summoner id (summoner-v4 ``id`` field). Seeders use :meth:`seeder_active_game`."""
         url = f"{self.settings.platform_host}/lol/spectator/v4/active-games/by-summoner/{encrypted_summoner_id}"
         r = await self._get(client, url)
         if r.status_code == 404:
@@ -102,18 +108,100 @@ class RiotClient:
         r.raise_for_status()
         return r.json()
 
-    async def featured_games(self, client: httpx.AsyncClient) -> list[dict[str, Any]]:
-        """Spectator featured game list (mixed MMR live matches on the shard)."""
-        url = f"{self.settings.platform_host}/lol/spectator/v4/featured-games"
+    async def active_game_by_puuid(self, client: httpx.AsyncClient, puuid: str) -> dict | None:
+        """
+        ``GET /lol/spectator/v5/active-games/by-summoner/{encryptedPUUID}`` (same PUUID string as match-v5).
+        """
+        p = puuid.strip().strip('"').strip("'").replace("\ufeff", "")
+        if not p:
+            return None
+        pid = quote(p, safe="")
+        url = f"{self.settings.platform_host}/lol/spectator/v5/active-games/by-summoner/{pid}"
         r = await self._get(client, url)
-        if r.status_code in (403, 404):
-            return []
+        if r.status_code == 404:
+            return None
         r.raise_for_status()
-        data = r.json()
-        raw_list = data.get("gameList")
-        if not isinstance(raw_list, list):
-            return []
-        return [dict(x) for x in raw_list]
+        return r.json()
+
+    async def seeder_active_game(self, client: httpx.AsyncClient, puuid: str) -> dict | None:
+        """
+        In-progress game for a seeder: spectator-v5 by PUUID first. On **HTTP 400**, fall back to
+        summoner-v4 by PUUID + spectator-v4 active game (some Riot responses reject the v5 path for otherwise valid ids).
+        """
+        p = puuid.strip().strip('"').strip("'").replace("\ufeff", "")
+        if not p:
+            return None
+        pid = quote(p, safe="")
+        url = f"{self.settings.platform_host}/lol/spectator/v5/active-games/by-summoner/{pid}"
+        r = await self._get(client, url)
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code == 404:
+            return None
+        if r.status_code == 400:
+            body = (r.text or "")[:240]
+            logger.warning(
+                "spectator-v5 active-game HTTP 400 puuid …%s — trying summoner-v4 + spectator-v4. body=%s",
+                p[-8:],
+                body,
+            )
+            summoner_id = await self.summoner_id_by_puuid(client, p)
+            if not summoner_id:
+                return None
+            return await self.active_game(client, summoner_id)
+        r.raise_for_status()
+        return r.json()
+
+    async def featured_games(self, client: httpx.AsyncClient) -> tuple[list[dict[str, Any]], str | None]:
+        """
+        Riot spectator **featured** list (small shard snapshot, not all live games).
+        Tries **spectator-v5** first, then **v4** if v5 is not available (e.g. HTTP 404 on route).
+        """
+        base = self.settings.platform_host
+        paths = ["/lol/spectator/v5/featured-games", "/lol/spectator/v4/featured-games"]
+
+        for i, path in enumerate(paths):
+            url = f"{base}{path}"
+            r = await self._get(client, url)
+            if r.status_code == 200:
+                try:
+                    data = r.json()
+                except Exception:
+                    logger.exception("featured-games JSON parse failed url=%s", path)
+                    return [], "Riot returned unreadable data for featured games; check server logs."
+                raw_list = data.get("gameList")
+                if not isinstance(raw_list, list):
+                    return [], None
+                return [dict(x) for x in raw_list], None
+            if r.status_code == 401:
+                return [], "Riot returned 401: RIOT_API_KEY is missing, wrong, or expired."
+            if r.status_code == 403:
+                return [], (
+                    "Riot returned 403 on spectator featured games: this developer key cannot use League spectator "
+                    "(spectator-v5 / v4). In https://developer.riotgames.com/ open the **same** app your key belongs "
+                    "to, confirm **League of Legends** is registered for that app, regenerate the **development** API "
+                    "key, and paste it into RIOT_API_KEY (no quotes/spaces). Production keys and dev keys are different."
+                )
+            if r.status_code == 429:
+                return [], "Riot rate limit (429): wait briefly and hit Refresh."
+            if r.status_code == 404 and i == 0:
+                logger.info("spectator-v5 featured-games returned 404; falling back to v4")
+                continue
+            if r.status_code == 404:
+                return [], None
+            logger.warning("featured-games %s HTTP %s: %s", path, r.status_code, (r.text or "")[:400])
+            if i == 0:
+                continue
+            return (
+                [],
+                f"Riot returned HTTP {r.status_code} for featured games (platform {self.settings.riot_platform!r}). "
+                "Check the key, portal product access, and RIOT_PLATFORM.",
+            )
+
+        return (
+            [],
+            "Featured games: spectator-v5 and v4 did not return a usable list (check RIOT_PLATFORM and server logs).",
+        )
 
     async def match_by_id(self, client: httpx.AsyncClient, match_id: str) -> dict | None:
         url = f"{self.settings.region_host}/lol/match/v5/matches/{match_id}"

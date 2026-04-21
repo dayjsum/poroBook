@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     riot_platform: str = "na1"
     riot_region: str = "americas"
     seeder_puuids: str = ""
+    # Development keys rate-limit hard; huge SEEDER_PUUIDS lists will 429 without a cap + delay.
+    seeder_max_lookups_per_poll: int = 10
+    seeder_request_delay_seconds: float = 0.18
     # featured = Riot spectator featured games (mixed skill, no seeders required).
     # seeders = only SEEDER_PUUIDS. both = merge featured + seeders.
     porobook_discovery_mode: str = "featured"
@@ -19,7 +22,12 @@ class Settings(BaseSettings):
     porobook_demo_stats: bool = False
     database_path: str = "porobook.db"
     war_room_cutoff_seconds: int = 301  # 5:01 on spectator clock
+    # Keep last lobby spectator payloads so war-room can open a card after Riot drops it from featured/active.
+    spectator_lobby_cache_seconds: int = 300
     poll_resolve_seconds: int = 45
+    # Background lobby harvest (Riot calls only here, not on GET /api/lobby).
+    lobby_harvest_interval_seconds: int = 75
+    lobby_harvest_jitter_seconds: int = 15
     # Min resolved predictions to appear on leaderboard (reduces tiny-sample luck).
     leaderboard_min_resolved: int = 10
     leaderboard_default_limit: int = 50
@@ -34,7 +42,13 @@ class Settings(BaseSettings):
 
     @property
     def seeder_puuid_list(self) -> list[str]:
-        return [p.strip() for p in self.seeder_puuids.split(",") if p.strip()]
+        raw = (self.seeder_puuids or "").replace("\r\n", ",").replace("\n", ",")
+        out: list[str] = []
+        for part in raw.split(","):
+            p = part.strip().strip('"').strip("'").replace("\ufeff", "")
+            if p:
+                out.append(p)
+        return out
 
     @field_validator("porobook_discovery_mode", mode="before")
     @classmethod

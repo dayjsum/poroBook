@@ -79,6 +79,7 @@ export type LobbyMatch = {
 };
 
 export async function registerUser(username: string) {
+  clearUserId();
   const u = await api<{ id: string; username: string }>("/api/users", {
     method: "POST",
     body: JSON.stringify({ username }),
@@ -88,10 +89,26 @@ export async function registerUser(username: string) {
 }
 
 export async function fetchMe(): Promise<User> {
-  return api<User>("/api/me");
+  try {
+    return await api<User>("/api/me");
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes("User not found")) {
+      clearUserId();
+    }
+    throw e;
+  }
 }
 
-export async function fetchLobby(): Promise<{ matches: LobbyMatch[]; notice?: string }> {
+export type LobbyResponse = {
+  matches: LobbyMatch[];
+  notice?: string | null;
+  harvested_at?: string | null;
+  harvester_status?: string;
+  quota_hit?: boolean;
+};
+
+export async function fetchLobby(): Promise<LobbyResponse> {
   return api("/api/lobby");
 }
 

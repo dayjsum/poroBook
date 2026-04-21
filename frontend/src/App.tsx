@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Link,
   NavLink,
@@ -11,6 +11,7 @@ import {
   useParams,
 } from "react-router-dom";
 import {
+  type LobbyResponse,
   LeaderboardEntry,
   LobbyMatch,
   User,
@@ -25,6 +26,19 @@ import {
   placePrediction,
   registerUser,
 } from "./api";
+
+function formatHarvestAge(iso: string | null | undefined, _tick = 0): string {
+  if (!iso) return "not yet";
+  void _tick;
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return "unknown";
+  const sec = Math.max(0, Math.floor((Date.now() - t) / 1000));
+  if (sec < 5) return "just now";
+  if (sec < 60) return `${sec}s ago`;
+  const m = Math.floor(sec / 60);
+  if (m < 60) return `${m}m ago`;
+  return `${Math.floor(m / 60)}h ago`;
+}
 
 function formatClock(seconds: number) {
   const m = Math.floor(seconds / 60);
@@ -286,7 +300,9 @@ function LeaderboardPage() {
         <div className="glass overflow-x-auto rounded-2xl">
           {leaderboard.length === 0 ? (
             <p className="p-5 text-sm text-slate-500">
-              No players on the board yet. Lock predictions from Games and wait for matches to finish.
+              No one is listed yet. The board only shows PoroBook accounts with at least {lbMinResolved} scored
+              predictions (wins + losses after Riot publishes the match). Live games on the Games page are from Riot,
+              not the same as “users” here — create an account, lock picks, and wait for games to resolve.
             </p>
           ) : (
             <table className="w-full min-w-[28rem] text-left text-sm text-slate-300">
@@ -334,6 +350,9 @@ function GamesLobbyPage() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [discoveryMode, setDiscoveryMode] = useState<string>("featured");
+  const [harvestedAt, setHarvestedAt] = useState<string | null>(null);
+  const [harvesterStatus, setHarvesterStatus] = useState<string | null>(null);
+  const [nowTick, setNowTick] = useState(0);
 
   useEffect(() => {
     void fetchPublicConfig()
@@ -356,22 +375,50 @@ function GamesLobbyPage() {
     void boot();
   }, []);
 
-  const refreshLobby = async () => {
+  const refreshLobby = useCallback(async () => {
     try {
       setError(null);
-      const data = await fetchLobby();
+      const data: LobbyResponse = await fetchLobby();
       setLobby(data.matches);
       setNotice(data.notice ?? null);
+      setHarvestedAt(data.harvested_at ?? null);
+      setHarvesterStatus(data.harvester_status ?? null);
+      return data;
     } catch (e) {
       setError(e instanceof Error ? e.message : "Lobby fetch failed");
+      return null;
     }
-  };
+  }, []);
 
   useEffect(() => {
-    void refreshLobby();
-    const id = window.setInterval(() => void refreshLobby(), 15000);
+    const id = window.setInterval(() => setNowTick((n) => n + 1), 1000);
     return () => window.clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    const POLL_MS = 8000;
+    const POLL_MS_ERROR = 15000;
+    let timeoutId = 0;
+    let cancelled = false;
+
+    const schedule = (ms: number) => {
+      window.clearTimeout(timeoutId);
+      timeoutId = window.setTimeout(tick, ms);
+    };
+
+    const tick = async () => {
+      if (cancelled) return;
+      const data = await refreshLobby();
+      if (cancelled) return;
+      schedule(data === null ? POLL_MS_ERROR : POLL_MS);
+    };
+
+    void tick();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+    };
+  }, [refreshLobby]);
 
   if (loading) {
     return <p className="text-slate-400">Loading…</p>;
@@ -386,7 +433,7 @@ function GamesLobbyPage() {
             ? "Live matches discovered only through your configured seeder accounts (any rank they play)."
             : discoveryMode === "both"
               ? "Live matches from Riot’s featured spectator list plus your seeders — order shuffles each refresh."
-              : "Live matches from Riot’s featured spectator list (mixed skill levels on your shard). Order shuffles each refresh. Open a match, read the delayed clock and comps, then lock a prediction after the analysis window."}
+              : "Real live matches come from a background harvester on the server (Riot featured / seeders on a timer, about 60–90s). This page only reads the cached snapshot — instant, no Riot call per click. Use Refresh from cache to pull the latest snapshot; the line below shows when the server last harvested."}
         </p>
       </div>
 
@@ -397,15 +444,29 @@ function GamesLobbyPage() {
       )}
 
       {notice && (
-        <div className="mb-6 rounded-xl border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm text-amber-50">
+        <div className="mb-6 whitespace-pre-line rounded-xl border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm text-amber-50">
           {notice}
         </div>
       )}
 
-      <div className="mb-4 flex items-center justify-between">
-        <h2 className="font-display text-lg text-white">Live lobbies</h2>
-        <button type="button" onClick={() => void refreshLobby()} className="text-sm text-slate-400 hover:text-white">
-          Refresh
+      <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h2 className="font-display text-lg text-white">Live lobbies</h2>
+          <p className="mt-1 text-xs text-slate-500">
+            Last harvested:{" "}
+            <span className="font-mono text-slate-300">{formatHarvestAge(harvestedAt, nowTick)}</span>
+            {harvesterStatus && harvesterStatus !== "ok" ? (
+              <span className="ml-2 text-amber-200/80">· status {harvesterStatus}</span>
+            ) : null}
+            <span className="ml-2 text-slate-600">· cache updates ~every 75s on server</span>
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => void refreshLobby()}
+          className="shrink-0 text-sm font-medium text-poro-gold hover:underline"
+        >
+          Refresh from cache
         </button>
       </div>
       <div className="grid gap-4 md:grid-cols-2">
@@ -414,8 +475,8 @@ function GamesLobbyPage() {
             {discoveryMode === "seeders"
               ? "No live games from your seeders right now — only a few are in queue at any moment. Try POROBOOK_DISCOVERY_MODE=featured or both, or try again at peak hours."
               : discoveryMode === "both"
-                ? "No live games from featured games or seeders this refresh. Try again in a minute or check that spectator-v4 (featured) is enabled on your API key."
-                : "No featured games returned this refresh. Riot’s list can be empty at quiet times; try again later or enable spectator-v4 on your developer key."}
+                ? "No live games from featured games or seeders this refresh. Try again in a minute or check that your Riot development key has the League product and spectator (v5/v4) access."
+                : "No featured games this refresh — Riot’s list rotates and can be empty at quiet times. Hit “Refresh for new games” a few times or try peak hours. If you always see nothing, fix spectator access on your Riot development key (403 in the notice above)."}
           </p>
         )}
         {lobby.map((m) => (
